@@ -1,7 +1,5 @@
-/* Xemu - Somewhat lame emulation (running on Linux/Unix/Windows/OSX, utilizing
-   SDL2) of some 8 bit machines, including the Commodore LCD and Commodore 65
-   and MEGA65 as well.
-   Copyright (C)2016-2020 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
+/* Part of the Xemu project, please visit: https://github.com/lgblgblgb/xemu
+   Copyright (C)2016-2025 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -30,16 +28,25 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 
 #define IS_KEY_PRESSED(pos)	(!(kbd_matrix[(pos) >> 4] & (1 << ((pos) & 7))))
 
-#define RESTORE_KEY_POS		0x80
-#define CAPSLOCK_KEY_POS	0x81
+#ifdef C65_KEYBOARD
+#	define C65_KEYBOARD_EXTRA_POS	0x80
+#	define SCRL_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 0)
+#	define TAB_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 1)
+#	define ALT_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 2)
+#	define RESTORE_KEY_POS		0x90
+#	define CAPSLOCK_KEY_POS		0x91
+#else
+#	define RESTORE_KEY_POS		0x80
+#	define CAPSLOCK_KEY_POS		0x81
+#endif
+
 #define IS_RESTORE_PRESSED()	IS_KEY_PRESSED(RESTORE_KEY_POS)
 //#define IS_RESTORE_PRESSED()	(!(kbd_matrix[RESTORE_KEY_POS >> 4] & (1 << (RESTORE_KEY_POS & 7))))
 
-#ifdef C65_KEYBOARD
-#define C65_KEYBOARD_EXTRA_POS	0x90
-#define SCRL_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 0)
-#define TAB_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 1)
-#define ALT_KEY_POS		(C65_KEYBOARD_EXTRA_POS + 2)
+
+#ifdef XEMU_OSK_SUPPORT
+#include "xemu/emutools_osk.h"
+extern const struct osk_desc_st osk_desc[];
 #endif
 
 extern const struct KeyMappingDefault c64_key_map[];

@@ -1,7 +1,5 @@
-/* Xemu - Somewhat lame emulation (running on Linux/Unix/Windows/OSX, utilizing
-   SDL2) of some 8 bit machines, including the Commodore LCD and Commodore 65
-   and the MEGA65 as well.
-   Copyright (C)2016-2020 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
+/* Part of the Xemu project, please visit: https://github.com/lgblgblgb/xemu
+   Copyright (C)2016-2025 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -38,11 +36,18 @@ struct KeyMappingUsed {
 #define KEYMAP_DEFAULT_FILENAME	"@keymap-default.cfg"
 #define KEYMAP_USER_FILENAME	"@keymap.cfg"
 extern void hid_keymap_from_config_file ( const char *fn );
+#ifdef HID_KBD_NO_F_HOTKEYS
+extern void hid_set_default_emu_f_hotkeys  ( void );
+#endif
 #endif
 
 extern Uint8 kbd_matrix[16];
 extern int   hid_show_osd_keys;
+extern int   hid_joy_on_cursor_keys;
+extern bool  hid_ignore_mouse_lbutton;
+extern bool  hid_ignore_mouse_rbutton;
 
+#define KBD_IS_PRESSED(a)	(!(kbd_matrix[(a) >> 4] & (1 << ((a) & 0x7))))
 #define KBD_CLEAR_MATRIX()      memset(kbd_matrix, 0xFF, sizeof kbd_matrix)
 #define KBD_PRESS_KEY(a)        kbd_matrix[(a) >> 4] &= ~(1 << ((a) & 0x7))
 #define KBD_RELEASE_KEY(a)      kbd_matrix[(a) >> 4] |=   1 << ((a) & 0x7)
@@ -60,11 +65,24 @@ extern int  emu_callback_key		( int pos, SDL_Scancode key, int pressed, int hand
 // Optinally can be defined by the emulator:
 extern void emu_dropfile_callback	( const char *fn );
 extern void emu_quit_callback		( void );
-extern void emu_callback_key_raw_sdl	( SDL_KeyboardEvent *ev );
-extern void emu_callback_key_texteditng_sdl ( SDL_TextEditingEvent *ev );
-extern void emu_callback_key_textinput_sdl  ( SDL_TextInputEvent   *ev );
+
+typedef int (*hid_sdl_keyboard_event_callback_t  ) (SDL_KeyboardEvent*   );	// REMOVED: void emu_callback_key_raw_sdl         ( SDL_KeyboardEvent*   )
+typedef int (*hid_sdl_textediting_event_callback_t)(SDL_TextEditingEvent*);	// REMOVED: void emu_callback_key_textediting_sdl ( SDL_TextEditingEvent*);
+typedef int (*hid_sdl_textinput_event_callback_t  )(SDL_TextInputEvent*  );	// REMOVED: void emu_callback_key_textinput_sdl   ( SDL_TextInputEvent*  );
+
+extern void hid_register_sdl_keyboard_event_callback	( const unsigned int level, hid_sdl_keyboard_event_callback_t    cb );
+extern void hid_register_sdl_textediting_event_callback	( const unsigned int level, hid_sdl_textediting_event_callback_t cb );
+extern void hid_register_sdl_textinput_event_callback	( const unsigned int level, hid_sdl_textinput_event_callback_t   cb );
+
+#define HID_CB_LEVEL_CORE	0
+#define HID_CB_LEVEL_CONSOLE	1
+#define HID_CB_LEVEL_EMU	2
+
+extern void hid_sdl_synth_key_event	( int matrix_pos, int is_press );
+extern void hid_sdl_synth_mouse_button_click ( const int button_id );
 
 // Provided HID functions:
+extern void hid_set_autoreleased_key    ( int key );
 extern int  hid_key_event		( SDL_Scancode key, int pressed ) ;
 extern void hid_reset_events		( int burn ) ;
 extern void hid_init			( const struct KeyMappingDefault *key_map_in, Uint8 virtual_shift_pos_in, int joy_enable ) ;
@@ -93,10 +111,9 @@ extern void hid_handle_all_sdl_events   ( void ) ;
 #define XEMU_EVENT_FAKE_JOY_RIGHT	0x104
 #define XEMU_EVENT_FAKE_JOY_FIRE	0x105
 #define XEMU_EVENT_TOGGLE_FULLSCREEN	0x106
+#define XEMU_EVENT_RESET		0x107
 
-#define STD_XEMU_SPECIAL_KEYS	\
-	{ SDL_SCANCODE_F9,	XEMU_EVENT_EXIT,		"XEMU-EXIT" }, \
-	{ SDL_SCANCODE_F11,	XEMU_EVENT_TOGGLE_FULLSCREEN,	"XEMU-FULLSCREEN" }, \
+#define STD_XEMU_SPECIAL_KEYS_OTHERS	\
 	{ SDL_SCANCODE_KP_5,	XEMU_EVENT_FAKE_JOY_FIRE,	"XEMU-JOY-FIRE" },	/* for joy FIRE  we map PC num keypad 5 */ \
 	{ SDL_SCANCODE_KP_0,	XEMU_EVENT_FAKE_JOY_FIRE,	"XEMU-JOY-FIRE" },	/* PC num keypad 0 is also the FIRE ... */ \
 	{ SDL_SCANCODE_RCTRL,	XEMU_EVENT_FAKE_JOY_FIRE,	"XEMU-JOY-FIRE" },	/* and RIGHT controll is also the FIRE ... to make Sven happy :) */ \
@@ -104,5 +121,29 @@ extern void hid_handle_all_sdl_events   ( void ) ;
 	{ SDL_SCANCODE_KP_2,	XEMU_EVENT_FAKE_JOY_DOWN,	"XEMU-JOY-DOWN" },	/* for joy DOWN  we map PC num keypad 2 */ \
 	{ SDL_SCANCODE_KP_4,	XEMU_EVENT_FAKE_JOY_LEFT,	"XEMU-JOY-LEFT" },	/* for joy LEFT  we map PC num keypad 4 */ \
 	{ SDL_SCANCODE_KP_6,	XEMU_EVENT_FAKE_JOY_RIGHT,	"XEMU-JOY-RIGHT" }	/* for joy RIGHT we map PC num keypad 6 */
+
+#define STD_XEMU_SPECIAL_KEYS_NO_F_HOTKEYS	\
+	{ SDL_SCANCODE_UNKNOWN,	XEMU_EVENT_EXIT,		"XEMU-EXIT" }, \
+	{ SDL_SCANCODE_UNKNOWN,	XEMU_EVENT_RESET,		"XEMU-RESET" }, \
+	{ SDL_SCANCODE_UNKNOWN,	XEMU_EVENT_TOGGLE_FULLSCREEN,	"XEMU-FULLSCREEN" },
+
+#define STD_XEMU_SPECIAL_KEYS_WITH_F_HOTKEYS	\
+	{ SDL_SCANCODE_F9,	XEMU_EVENT_EXIT,		"XEMU-EXIT" }, \
+	{ SDL_SCANCODE_F10,	XEMU_EVENT_RESET,		"XEMU-RESET" }, \
+	{ SDL_SCANCODE_F11,	XEMU_EVENT_TOGGLE_FULLSCREEN,	"XEMU-FULLSCREEN" },
+
+#ifdef HID_KBD_NO_F_HOTKEYS
+#	define	STD_XEMU_SPECIAL_KEYS			\
+		STD_XEMU_SPECIAL_KEYS_NO_F_HOTKEYS	\
+		STD_XEMU_SPECIAL_KEYS_OTHERS
+#else
+#	define	STD_XEMU_SPECIAL_KEYS			\
+		STD_XEMU_SPECIAL_KEYS_WITH_F_HOTKEYS	\
+		STD_XEMU_SPECIAL_KEYS_OTHERS
+#endif
+
+#if defined(CONFIG_KBD_ALSO_TEXTEDITING_SDL_CALLBACK) || defined(CONFIG_KBD_ALSO_TEXTINPUT_SDL_CALLBACK) || defined(CONFIG_KBD_ALSO_RAW_SDL_CALLBACK)
+#error "Feature request macros CONFIG_KBD_ALSO_TEXTEDITING_SDL_CALLBACK / CONFIG_KBD_ALSO_TEXTINPUT_SDL_CALLBACK / CONFIG_KBD_ALSO_RAW_SDL_CALLBACK has been **REMOVED**, emulator code **MUST** be reworked for the new API!"
+#endif
 
 #endif

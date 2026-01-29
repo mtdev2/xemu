@@ -1,6 +1,6 @@
-/* Xep128: Minimalistic Enterprise-128 emulator with focus on "exotic" hardware
-   Copyright (C)2015,2016 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
-   http://xep128.lgb.hu/
+/* Minimalistic Enterprise-128 emulator with focus on "exotic" hardware
+   Part of the Xemu project, please visit: https://github.com/lgblgblgb/xemu
+   Copyright (C)2015-2023 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -24,12 +24,14 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 	http://www.mouser.com/ds/2/380/spansion%20inc_am29f400b_eol_21505e8-329620.pdf
 */
 
-#include "xep128.h"
+#include "xemu/emutools.h"
+#include "xemu/emutools_files.h"
+#include "enterprise128.h"
 #include "sdext.h"
 #include "cpu.h"
-#include "configuration.h"
-
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
 
 #ifndef CONFIG_SDEXT_SUPPORT
 #warning "SDEXT support is disabled by configuration."
@@ -74,8 +76,7 @@ static int writing;
 static int delay_answer;
 static void (*ans_callback)(void);
 
-static FILE *sdf;
-static int sdfd;
+static int sdfd =  -1;
 static Uint8 _buffer[1024];
 off_t sd_card_size = 0;
 
@@ -182,8 +183,8 @@ static inline off_t _assert_on_csd_size_mismatch ( off_t expected_size, int expe
 	int blocklen = 2 ** i["READ_BL_LEN"]
 	off_t size = (off_t)blocknr * (off_t)blocklen;
 	if (size != expected_size || mult != expected_mult || blocknr != excepted_blocknr || blocklen != expected_blocklen)
-		FATAL("Internal CSD size calculation failure!\nExpected=" PRINTF_LLD " Got=" PRINTF_LLD " (mult=%d blocknr=%d blocklen=%d)",
-			(long long)expected_size, (long long)size,
+		FATAL("Internal CSD size calculation failure!\nExpected=" PRINTF_S64 " Got=" PRINTF_S64 " (mult=%d blocknr=%d blocklen=%d)",
+			(Sint64)expected_size, (Sint64)size,
 			mult, blocknr, blocklen
 		);
 }
@@ -230,8 +231,8 @@ static int sdext_check_and_set_size ( void )
 	int is_vhd;
 	if (sd_card_size < MIN_CARD_SIZE) {
 		ERROR_WINDOW(
-			"SD card image file \"%s\" is too small, minimal size is " PRINTF_LLD " Mbytes, but this one is " PRINTF_LLD " bytes long (about " PRINTF_LLD " Mbytes). SD access has been disabled!",
-			sdimg_path, (long long)(MIN_CARD_SIZE >> 20), (long long)sd_card_size, (long long)(sd_card_size >> 20)
+			"SD card image file \"%s\" is too small, minimal size is " PRINTF_U64 " Mbytes, but this one is " PRINTF_U64 " bytes long (about " PRINTF_U64 " Mbytes). SD access has been disabled!",
+			sdimg_path, (Uint64)(MIN_CARD_SIZE >> 20), (Uint64)sd_card_size, (Uint64)(sd_card_size >> 20)
 		);
 		return 1;
 	}
@@ -267,9 +268,9 @@ static int sdext_check_and_set_size ( void )
 		DEBUG("SDEXT: VHD file is not detected." NL);
 	if (sd_card_size > MAX_CARD_SIZE) {	// do this check here, as VHD footer could overflow on 2G boundary at the beginning what we have support for in Xep128
 		ERROR_WINDOW(
-			"SD card image file \"%s\" is too large, maximal allowed size is " PRINTF_LLD " Mbytes, but this one is " PRINTF_LLD " bytes long (about " PRINTF_LLD " Mbytes). "
+			"SD card image file \"%s\" is too large, maximal allowed size is " PRINTF_U64 " Mbytes, but this one is " PRINTF_U64 " bytes long (about " PRINTF_U64 " Mbytes). "
 			"SD access has been disabled!",
-			sdimg_path, (long long)(MAX_CARD_SIZE >> 20), (long long)sd_card_size, (long long)(sd_card_size >> 20)
+			sdimg_path, (Uint64)(MAX_CARD_SIZE >> 20), (Uint64)sd_card_size, (Uint64)(sd_card_size >> 20)
 		);
 		return 1;
 	}
@@ -285,7 +286,7 @@ static int sdext_check_and_set_size ( void )
 		return 0;
 	if (is_vhd)
 		WARNING_WINDOW("SD-card image \"%s\" is promoted for extension but it seems to be a VHD file.\nIf you allow extension it WON'T BE USED AS VHD ANY MORE BY OTHER SOFTWARE!", sdimg_path);
-	INFO_WINDOW("SD-card image file \"%s\" is about to be extended with %d bytes (the next valid SD-card size), new size is: " PRINTF_LLD, sdimg_path, (int)(new_size - sd_card_size), (long long)new_size);
+	INFO_WINDOW("SD-card image file \"%s\" is about to be extended with %d bytes (the next valid SD-card size), new size is: " PRINTF_U64, sdimg_path, (int)(new_size - sd_card_size), (Uint64)new_size);
 	if (!QUESTION_WINDOW("Not allowed|Allowed (DANGEROUS)", "Do you allow this extension? NOTE: it's a test feature, do not allow it, if you are unsure!")) {
 		INFO_WINDOW("You didn't allow the extension. You can continue, but some EP128 software may fail (ie: fdisk)!");
 		return 0;
@@ -305,75 +306,80 @@ static int sdext_check_and_set_size ( void )
 
 
 
+void sdext_shutdown ( void )
+{
+	if (sdfd >= 0) {
+		close(sdfd);
+		sdfd = -1;
+	}
+}
+
+
 /* SDEXT emulation currently excepts the cartridge area (segments 4-7) to be filled
  * with the FLASH ROM content. Even segment 7, which will be copied to the second 64K "hidden"
  * and pagable flash area of the SD cartridge. Currently, there is no support for the full
  * sized SDEXT flash image */
-void sdext_init ( void )
+int sdext_init ( const char *img_fn )
 {
+	sdext_shutdown();
 	/* try to detect SDEXT ROM extension and only turn on emulation if it exists */
 	if (sdext_detect_rom()) {
 		WARNING_WINDOW("No SD-card cartridge ROM code found in loaded ROM set. SD card hardware emulation has been disabled!");
 		*sdimg_path = 0;
-		sdf = NULL;
 		SD_DEBUG("SDEXT: init: REFUSE: no SD-card cartridge ROM code found in loaded ROM set." NL);
-		return;
+		return 0;
 	}
 	SD_DEBUG("SDEXT: init: cool, SD-card cartridge ROM code seems to be found in loaded ROM set, enabling SD card hardware emulation ..." NL);
 	// try to open SD card image. If not found, and it's the DEFAULT config option we provide user to install an empty one (and later to download a populated one)
-try_to_open_image:
-	sdf = open_emu_file(config_getopt_str("sdimg"), "rb", sdimg_path); // open in read-only mode, to get the path
-	if (sdf) {
-		fclose(sdf);
-		sdf = fopen(sdimg_path, "r+b");
-		if (sdf) {
-			DEBUGPRINT("SDEXT: SD image file is re-open in read/write mode, good (fd=%d)." NL, fileno(sdf));
+	for (;;) {
+		int ro = O_RDONLY;
+		sdfd = xemu_open_file(img_fn, O_RDWR, &ro, sdimg_path);
+		ro = (ro != XEMU_OPEN_FILE_FIRST_MODE_USED);
+		if (sdfd >= 0) {
+			DEBUGPRINT("SDEXT: SD-card image is open %s from file %s" NL, sdimg_path, ro ? "R/O" : "R/W");
+			if (ro)
+				INFO_WINDOW("Warning, SD-card image could be opened only in read-only mode!");
+			break;
 		} else {
-			sdf = fopen(sdimg_path, "rb");
-			DEBUGPRINT("SDEXT: SD image cannot be re-open in read-write mode, using read-only access (fd=%d)." NL, fileno(sdf));
+			if (!strcmp(img_fn, SDCARD_IMG_FN)) {
+				// if this was the default image, then we may want to give some help to the user to create it!
+				int r = QUESTION_WINDOW("?Exit|!Continue without SD card|Create empty image", "Cannot open default SD card image file.");
+				if (r == 1)
+					break;
+				if (r == 0)
+					XEMUEXIT(0);
+				if (r == 2) {	// create an empty image
+					sdfd = xemu_open_file(img_fn, O_CREAT | O_TRUNC | O_RDWR, NULL, sdimg_path);
+					if (sdfd < 0) {
+						ERROR_WINDOW("Cannot create empty image: %s", ERRSTR());
+						continue;
+					}
+					if (decompress_vhd(empty_vhd_image, sdfd)) {
+						ERROR_WINDOW("Error decompressing empty image: %s",  ERRSTR());
+						close(sdfd);
+						sdfd = -1;
+						unlink(sdimg_path);
+						continue;
+					}
+					break;
+				}
+			} else {
+				ERROR_WINDOW("Could not open requested SD-card image: %s\n%s", ERRSTR(), img_fn);
+				XEMUEXIT(0);
+			}
 		}
 	}
-	// if we couldn't open image _AND_ it was the default ...
-	if (!sdf && !strcmp(config_getopt_str("sdimg"), SDCARD_IMG_FN)) {
-		int r = QUESTION_WINDOW("?Exit|!Continue without SD card|Create empty image", "Cannot open default SD card image file.");
-		if (r == 0)
-			XEMUEXIT(0);
-		else if (r == 2) {	// create an empty image
-			char pathbuffer[PATH_MAX + 1];
-			snprintf(sdimg_path, PATH_MAX, "%s%s.tmp", app_pref_path, SDCARD_IMG_FN[0] == '@' ? SDCARD_IMG_FN + 1 : SDCARD_IMG_FN);
-			sdf = open_emu_file(sdimg_path, "wb", pathbuffer);
-			if (!sdf) {
-				ERROR_WINDOW("Cannot create empty image: %s", ERRSTR());
-				goto try_to_open_image;
-			}
-			r = decompress_vhd(empty_vhd_image, fileno(sdf));
-			if (r) {
-				ERROR_WINDOW("Error decompressing empty image: %s",  ERRSTR());
-				fclose(sdf);
-				unlink(sdimg_path);
-				goto try_to_open_image;
-			}
-			fclose(sdf);
-			pathbuffer[strlen(pathbuffer) - 4] = 0;
-			if (rename(sdimg_path, pathbuffer))
-				ERROR_WINDOW("Rename of created temp file error: %s", ERRSTR());
-			else
-				INFO_WINDOW("Empty image file has been created: %s", pathbuffer);
-			goto try_to_open_image;	// loop again, now with successfully created image we will have better chance :)
-		}
-	}
-	if (!sdf) {
+	if (sdfd < 0) {
 		WARNING_WINDOW("SD card image file \"%s\" cannot be open: %s. You can use Xep128 but SD card access won't work!", sdimg_path, ERRSTR());
 		*sdimg_path = 0;
 	} else {
-		sdfd = fileno(sdf);
 		sd_card_size = lseek(sdfd, 0, SEEK_END);
 		if (sdext_check_and_set_size()) {
-			fclose(sdf);
-			sdf = NULL;
+			close(sdfd);
+			sdfd = -1;
 			*sdimg_path = 0;
 		} else
-			DEBUG("SDEXT: SD card size is: " PRINTF_LLD " bytes" NL, (long long)sd_card_size);
+			DEBUG("SDEXT: SD card size is: " PRINTF_U64 " bytes" NL, (Uint64)sd_card_size);
 	}
 	memset(sd_rom_ext, 0xFF, 0x10000);
 	/* Copy ROM image of 16K to the second 64K of the cartridge flash. Currently only 8K is used.
@@ -394,6 +400,7 @@ try_to_open_image:
 	_spi_last_w = 0xFF;
 	writing = -2;
 	SD_DEBUG("SDEXT: init end" NL);
+	return 0;
 }
 
 
@@ -411,7 +418,7 @@ static void _block_read ( void )
 	_buffer[1] = 0xFE; // data token
 	//ret = fread(_buffer + 2, 1, 512, sdf);
 	ret = read(sdfd, _buffer + 2, 512);
-	SD_DEBUG("SDEXT: REGIO: fread retval = %d" NL, ret);
+	SD_DEBUG("SDEXT: REGIO: read retval = %d" NL, ret);
 	(void)ret;
 	_buffer[512 + 2] = 0; // CRC
 	_buffer[512 + 3] = 0; // CRC
@@ -422,7 +429,7 @@ static void _block_read ( void )
 
 
 
-/* SPI is a read/write in once stuff. We have only a single function ... 
+/* SPI is a read/write in once stuff. We have only a single function ...
  * _write_b is the data value to put on MOSI
  * _read_b is the data read from MISO without spending _ANY_ SPI time to do shifting!
  * This is not a real thing, but easier to code this way.
@@ -550,7 +557,7 @@ static void _spi_shifting_with_sd_card ()
 		case 17: // CMD17: read a single block, babe
 		case 18: // CMD18: read multiple blocks
 			blocks = 0;
-			if (sdf == NULL)
+			if (sdfd < 0)
 				_read_b = 32; // address error, if no SD card image ... [this is bad TODO, better error handling]
 			else {
 				off_t ret, _offset = (cmd[1] << 24) | (cmd[2] << 16) | (cmd[3] << 8) | cmd[4];
@@ -766,7 +773,7 @@ Uint8 sdext_read_cart ( Uint16 addr )
 		return old;
 	} else
 		switch (addr & 3) {
-			case 0: 
+			case 0:
 				// regular read (not HS) only gives the last shifted-in data, that's all!
 				SD_DEBUG("SDEXT: REGIO: R: DATA: SPI data register regular read %02X" NL, _read_b);
 				return _read_b;

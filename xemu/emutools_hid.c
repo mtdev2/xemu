@@ -1,7 +1,5 @@
-/* Xemu - Somewhat lame emulation (running on Linux/Unix/Windows/OSX, utilizing
-   SDL2) of some 8 bit machines, including the Commodore LCD and Commodore 65
-   and the MEGA65 as well.
-   Copyright (C)2016-2020 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
+/* Part of the Xemu project, please visit: https://github.com/lgblgblgb/xemu
+   Copyright (C)2016-2025 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -22,6 +20,11 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 #ifdef HID_KBD_MAP_CFG_SUPPORT
 #include "xemu/emutools_files.h"
 #endif
+#include "xemu/emutools_osk.h"
+
+#if defined(XEMU_ARCH_ANDROID) && !defined(XEMU_OSK_SUPPORT)
+#error "Android builds needs XEMU_OSK_SUPPORT to be enabled."
+#endif
 
 
 /* Note: HID stands for "Human Input Devices" or something like that :)
@@ -34,12 +37,17 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 
 Uint8 kbd_matrix[16];		// keyboard matrix state, 16 * 8 bits at max currently (not compulsory to use all positions!)
 int hid_show_osd_keys = 0;
+int hid_joy_on_cursor_keys = 0;	// working mode to have cursor keys as joystick not regular key emu
+bool hid_ignore_mouse_lbutton = false;
+bool hid_ignore_mouse_rbutton = false;
 
 static int mouse_delta_x;
 static int mouse_delta_y;
 static unsigned int hid_state;
 
 #define MAX_JOYSTICKS			16
+
+#define ANDROID_PINCH_THRESHOLD		0.01
 
 static SDL_Joystick *joysticks[MAX_JOYSTICKS];
 
@@ -55,15 +63,53 @@ static SDL_Joystick *joysticks[MAX_JOYSTICKS];
 static Uint8 virtual_shift_pos = 0;
 static struct KeyMappingUsed key_map[0x100];
 static const struct KeyMappingDefault *key_map_default;
+static int release_this_key_on_first_event = -1;
+
+// Custom callbacks
+#define HID_MAX_CUSTOM_CALLBACKS 3
+static hid_sdl_keyboard_event_callback_t    sdl_keyboard_event_cbs[HID_MAX_CUSTOM_CALLBACKS];
+static hid_sdl_textediting_event_callback_t sdl_textediting_event_cbs[HID_MAX_CUSTOM_CALLBACKS];
+static hid_sdl_textinput_event_callback_t   sdl_textinput_event_cbs[HID_MAX_CUSTOM_CALLBACKS];
+
+
+void hid_set_autoreleased_key ( int key )
+{
+	release_this_key_on_first_event = key;
+}
 
 
 int hid_key_event ( SDL_Scancode key, int pressed )
 {
 	const struct KeyMappingUsed *map = key_map;
-	if (hid_show_osd_keys)
+	if (XEMU_UNLIKELY(hid_show_osd_keys))
 		OSD(-1, -1, "Key %s <%s>", pressed ? "press  " : "release", SDL_GetScancodeName(key));
+	if (XEMU_UNLIKELY(hid_joy_on_cursor_keys)) {
+		// hid_joy_on_cursor_keys signals a special mode to emulate joystick with cursor-keys if enabled,
+		// instead of the normal functionality of those keys. Right-CTRL is fire.
+		int sel;
+		switch (key) {
+			case SDL_SCANCODE_UP:	sel = JOYSTATE_UP;	break;
+			case SDL_SCANCODE_DOWN:	sel = JOYSTATE_DOWN;	break;
+			case SDL_SCANCODE_LEFT:	sel = JOYSTATE_LEFT;	break;
+			case SDL_SCANCODE_RIGHT:sel = JOYSTATE_RIGHT;	break;
+			case SDL_SCANCODE_RGUI:		// Mac does not seem to have right CTRL. Use this too, right-GUI key is right-command (or right-windows key on PC or wtf ...)
+			case SDL_SCANCODE_RCTRL:sel = JOYSTATE_BUTTON;	break;
+			default:		sel = -1;		break;
+		}
+		if (sel >= 0) {
+			if (pressed)
+				hid_state |= sel;
+			else
+				hid_state &= ~sel;
+			return 1;
+		}
+	}
 	while (map->pos >= 0) {
 		if (map->scan == key) {
+			if (XEMU_UNLIKELY(release_this_key_on_first_event > 0)) {
+				KBD_RELEASE_KEY(release_this_key_on_first_event);
+				release_this_key_on_first_event = -1;
+			}
 			if (map->pos > 0xFF) {	// special emulator key!
 				switch (map->pos) {	// handle "built-in" events, if emulator target uses them at all ...
 					case XEMU_EVENT_EXIT:
@@ -102,6 +148,45 @@ int hid_key_event ( SDL_Scancode key, int pressed )
 		map++;
 	}
 	return emu_callback_key(-1, key, pressed, 0);
+}
+
+
+void hid_sdl_synth_key_event ( int matrix_pos, int is_press )
+{
+	const struct KeyMappingUsed *map = key_map;
+	while (map->pos >= 0) {
+		if (map->pos == matrix_pos) {
+			SDL_Event sdlevent = {};
+			sdlevent.type = is_press ? SDL_KEYDOWN : SDL_KEYUP;
+			sdlevent.key.repeat = 0;
+			sdlevent.key.windowID = sdl_winid;
+			sdlevent.key.state = is_press ? SDL_PRESSED : SDL_RELEASED;
+			sdlevent.key.keysym.scancode = map->scan;
+			SDL_PushEvent(&sdlevent);
+			return;
+		}
+		map++;
+	}
+}
+
+
+void hid_sdl_synth_mouse_button_click ( const int button_id )
+{
+	SDL_Event sdlevent = {
+		.button.timestamp = SDL_GetTicks() - 100,
+		.button.windowID = sdl_winid,
+		.button.which = 1,      // hmmm
+		.button.button = button_id,
+		.button.state = SDL_PRESSED,
+		.button.clicks = 1,     // single click
+	};
+	sdlevent.type = SDL_MOUSEBUTTONDOWN;
+	SDL_PushEvent(&sdlevent);
+	// also we need to _release_ the mouse button as well
+	sdlevent.type = SDL_MOUSEBUTTONUP;
+	sdlevent.button.state = SDL_RELEASED;
+	sdlevent.button.timestamp += 100;
+	SDL_PushEvent(&sdlevent);
 }
 
 
@@ -167,6 +252,24 @@ const char *hid_keymap_add_mapping ( const char *emu_key_name, const char *host_
 	}
 	return NULL;
 }
+
+
+#ifdef HID_KBD_NO_F_HOTKEYS
+void hid_set_default_emu_f_hotkeys ( void )
+{
+	// Make sure to un-map the needed keys
+	hid_keymap_add_mapping("F9", "Unknown");
+	hid_keymap_add_mapping("F9*", "Unknown");
+	hid_keymap_add_mapping("F10", "Unknown");
+	hid_keymap_add_mapping("F10*", "Unknown");
+	hid_keymap_add_mapping("F11", "Unknown");
+	hid_keymap_add_mapping("F11*", "Unknown");
+	// Map keys now as emu hot-keys
+	hid_keymap_add_mapping("XEMU-EXIT", "F9");
+	hid_keymap_add_mapping("XEMU-RESET", "F10");
+	hid_keymap_add_mapping("XEMU-FULLSCREEN", "F11");
+}
+#endif
 
 
 const char *hid_keymap_add_mapping_from_config_line ( const char *p, int *num_of_items )
@@ -242,7 +345,15 @@ void hid_keymap_from_config_file ( const char *fn )
 
 void hid_init ( const struct KeyMappingDefault *key_map_in, Uint8 virtual_shift_pos_in, int joy_enable )
 {
-	int a;
+	if (!key_map_in) {
+		DEBUGPRINT("HID: warning, hid_init() was called key_map_in=NULL. This seems to be a FreeBSD specific bug, as far as I can tell from experience." NL);
+		return;
+	}
+	for (int a = 0; a < HID_MAX_CUSTOM_CALLBACKS; a++) {
+		sdl_keyboard_event_cbs[a] = NULL;
+		sdl_textediting_event_cbs[a] = NULL;
+		sdl_textinput_event_cbs[a] = NULL;
+	}
 #ifdef HID_KBD_MAP_CFG_SUPPORT
 	char kbdcfg[8192];
 	char *kp = kbdcfg + sprintf(kbdcfg,
@@ -258,10 +369,10 @@ void hid_init ( const struct KeyMappingDefault *key_map_in, Uint8 virtual_shift_
 		"# EMU-KEY-NAME strings starting with XEMU- are special Xemu related 'hot keys'" NL
 		NL
 		,
-		KEYMAP_USER_FILENAME + 1
+		(KEYMAP_USER_FILENAME) + 1
 	);
 #endif
-	for (a = 0;;) {
+	for (int a = 0;;) {
 		if (a >= 0x100)
 			FATAL("Too long default keymapping table for hid_init()");
 		key_map[a].pos = key_map_in[a].pos;
@@ -330,15 +441,15 @@ void hid_joystick_device_event ( int which , int is_attach )
 		if (joysticks[which])
 			hid_joystick_device_event(which, 0);
 		joysticks[which] = SDL_JoystickOpen(which);
-		if (joysticks[which]) {
-			INFO_WINDOW("HID: joystick device #%d \"%s\" has been added." NL, which, SDL_JoystickName(joysticks[which]));
-		} else
-			DEBUG("HID: joystick device #%d problem, cannot be opened on 'add' event: %s." NL, which, SDL_GetError());
+		if (joysticks[which])
+			DEBUGPRINT("HID: joystick device #%d \"%s\" has been added." NL, which, SDL_JoystickName(joysticks[which]));
+		else
+			DEBUGPRINT("HID: joystick device #%d problem, cannot be opened on 'add' event: %s." NL, which, SDL_GetError());
 	} else {
 		if (joysticks[which]) {
 			SDL_JoystickClose(joysticks[which]);
 			joysticks[which] = NULL;
-			DEBUG("HID: joystick device #%d has been removed." NL, which);
+			DEBUGPRINT("HID: joystick device #%d has been removed." NL, which);
 			// This is needed to avoid "stuck" joystick state if removed in that state ...
 			hid_state &= ~(JOYSTATE_UP | JOYSTATE_DOWN | JOYSTATE_LEFT | JOYSTATE_RIGHT | JOYSTATE_BUTTON);
 		}
@@ -453,6 +564,13 @@ int hid_read_mouse_button_right ( int on, int off )
 }
 
 
+#define TRY_CUSTOM_CALLBACKS(cbs,par) do { \
+	for (int i = 0; i < HID_MAX_CUSTOM_CALLBACKS; i++) \
+		if (cbs[i] && !cbs[i](par)) \
+			goto give_up; \
+} while(0)
+
+
 int hid_handle_one_sdl_event ( SDL_Event *event )
 {
 	int handled = 1;
@@ -475,10 +593,13 @@ int hid_handle_one_sdl_event ( SDL_Event *event )
 			break;
 		case SDL_KEYUP:
 		case SDL_KEYDOWN:
-			if (
-#ifndef CONFIG_KBD_ALSO_REPEATS
-				event->key.repeat == 0 &&
+#ifdef XEMU_ARCH_ANDROID
+			if (event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_AC_BACK) {	// Android "back" button
+				osk_show(!osk_status());
+				break;
+			}
 #endif
+			if (
 				event->key.keysym.scancode != SDL_SCANCODE_UNKNOWN
 #ifdef CONFIG_KBD_SELECT_FOCUS
 				&& (event->key.windowID == sdl_winid || event->key.windowID == 0)
@@ -490,10 +611,13 @@ int hid_handle_one_sdl_event ( SDL_Event *event )
 				&& !(event->key.keysym.scancode == SDL_SCANCODE_TAB && (event->key.keysym.mod & KMOD_LALT))
 #endif
 			) {
-#ifdef CONFIG_KBD_ALSO_RAW_SDL_CALLBACK
-				emu_callback_key_raw_sdl(&event->key);
+				// Note: if this one is requested, it is fired even on key repeats, while the normal
+				// HID callback may NOT!
+				TRY_CUSTOM_CALLBACKS(sdl_keyboard_event_cbs, &event->key);
+#ifndef CONFIG_KBD_ALSO_REPEATS
+				if (event->key.repeat == 0)
 #endif
-				hid_key_event(event->key.keysym.scancode, event->key.state == SDL_PRESSED);
+					hid_key_event(event->key.keysym.scancode, event->key.state == SDL_PRESSED);
 			}
 			break;
 		case SDL_JOYDEVICEADDED:
@@ -512,30 +636,53 @@ int hid_handle_one_sdl_event ( SDL_Event *event )
 				hid_joystick_motion_event(event->jaxis.axis, event->jaxis.value);
 			break;
 		case SDL_MOUSEMOTION:
+#ifdef			XEMU_OSK_SUPPORT
+			if (osk_status()) {
+				osk_mouse_movement_event(event->motion.x, event->motion.y);
+				break;
+			}
+#endif
 			if (is_mouse_grab())
 				hid_mouse_motion_event(event->motion.xrel, event->motion.yrel);
 			break;
 		case SDL_MOUSEBUTTONDOWN:
 		case SDL_MOUSEBUTTONUP:
+#ifdef			XEMU_OSK_SUPPORT
+			if (event->type == SDL_MOUSEBUTTONUP && osk_status()) {
+				if (osk_key_activation_event(event->button.x, event->button.y))
+					break;
+			}
+#endif
+			if ((hid_ignore_mouse_lbutton && event->button.button == SDL_BUTTON_LEFT) || (hid_ignore_mouse_rbutton && event->button.button == SDL_BUTTON_RIGHT))
+				break;
 			if (is_mouse_grab())
 				hid_mouse_button_event(event->button.button, event->type == SDL_MOUSEBUTTONDOWN);
 			else
 				emu_callback_key(-2, 0, event->type == SDL_MOUSEBUTTONDOWN, event->button.button);
 			break;
-#ifdef CONFIG_KBD_ALSO_TEXTEDITING_SDL_CALLBACK
 		case SDL_TEXTEDITING:
-			emu_callback_key_texteditng_sdl(&event->edit);
+			TRY_CUSTOM_CALLBACKS(sdl_textediting_event_cbs, &event->edit);
 			break;
-#endif
-#ifdef CONFIG_KBD_ALSO_TEXTINPUT_SDL_CALLBACK
 		case SDL_TEXTINPUT:
-			emu_callback_key_textinput_sdl(&event->text);
+			TRY_CUSTOM_CALLBACKS(sdl_textinput_event_cbs, &event->text);
+			break;
+#ifdef		XEMU_ARCH_ANDROID
+		case SDL_MULTIGESTURE:
+			if (event->mgesture.numFingers >= 2) {
+				if (event->mgesture.dDist < -ANDROID_PINCH_THRESHOLD) {
+					osk_show(true);
+				} else if (event->mgesture.dDist > ANDROID_PINCH_THRESHOLD) {
+					osk_show(false);
+					hid_sdl_synth_mouse_button_click(SDL_BUTTON_RIGHT);
+				}
+			}
 			break;
 #endif
 		default:
 			handled = 0;
 			break;
 	}
+give_up:
 	return handled;
 }
 
@@ -546,5 +693,20 @@ void hid_handle_all_sdl_events ( void )
 	SDL_Event event;
 	while (SDL_PollEvent(&event) != 0)
 		hid_handle_one_sdl_event(&event);
+}
 
+
+void hid_register_sdl_keyboard_event_callback ( const unsigned int level, hid_sdl_keyboard_event_callback_t cb )
+{
+	sdl_keyboard_event_cbs[level] = cb;
+}
+
+void hid_register_sdl_textediting_event_callback ( const unsigned int level, hid_sdl_textediting_event_callback_t cb )
+{
+	sdl_textediting_event_cbs[level] = cb;
+}
+
+void hid_register_sdl_textinput_event_callback ( const unsigned int level, hid_sdl_textinput_event_callback_t cb )
+{
+	sdl_textinput_event_cbs[level] = cb;
 }

@@ -1,7 +1,5 @@
-/* Xemu - Somewhat lame emulation (running on Linux/Unix/Windows/OSX, utilizing
-   SDL2) of some 8 bit machines, including the Commodore LCD and Commodore 65
-   and MEGA65 as well.
-   Copyright (C)2016-2020 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
+/* Part of the Xemu project, please visit: https://github.com/lgblgblgb/xemu
+   Copyright (C)2016-2024 LGB (Gábor Lénárt) <lgblgblgb@gmail.com>
 
 | For more information about "cpu65" please also read comments in file cpu65.c |
 
@@ -55,9 +53,8 @@ struct cpu65_st {
 	Uint8 s;
 	Uint8 op;
 #ifdef MEGA65
-	Uint8 previous_op;
 	int nmos_mode;
-	int neg_neg_prefix;
+	int prefix;
 #endif
 #ifdef CPU_65CE02
 	Uint8 z;
@@ -75,6 +72,12 @@ struct cpu65_st {
 	int multi_step_stop_trigger;	// not used, only with multi-op mode but still here because some devices (like DMA) would use it
 	int irqLevel, nmiEdge;
 	int op_cycles;
+#ifdef CPU65_EXECUTION_CALLBACK_SUPPORT
+	bool execution_debug_callback;
+	// this must be used by the emulator target, CPU65 core will/can set this value, but never uses it:
+	// >> Must be done by the target to see if it's valid to call cpu65_step() **at all** <<
+	bool running;			// this must be used by the emulator target, CPU65 core will/can set this value, but never uses it. Must be done by the target to see if it's valid to call
+#endif
 };
 
 #ifndef CPU65
@@ -84,11 +87,12 @@ struct cpu65_st {
 extern struct cpu65_st CPU65;
 
 #ifdef MEGA65
-extern int  cpu_linear_memory_addressing_is_enabled;
+extern int  cpu_mega65_opcodes;
+extern void cpu65_init_mega_specific ( void );
 #endif
 
 #ifdef CPU65_65CE02_6502NMOS_TIMING_EMULATION
-extern void cpu65_set_ce_timing ( int is_ce );
+extern void cpu65_set_timing ( unsigned int mode );
 #endif
 //extern int cpu_multi_step_stop_trigger;
 
@@ -110,23 +114,49 @@ extern void  cpu65_illegal_opcode_callback ( void );
 #endif
 
 extern void cpu65_reset ( void );
+extern void cpu65_init ( void );	// optional to be called, cpu_reset() calls this as well. See cpu65.c for more info on this.
+extern void cpu65_debug_set_pc ( const Uint16 new_pc );
 extern int  cpu65_step  (
 #ifdef CPU_STEP_MULTI_OPS
-	int run_for_cycles
+	const int run_for_cycles
 #else
 	void
 #endif
 );
 
+#ifdef CPU65_EXECUTION_CALLBACK_SUPPORT
+// These must be provided by the target emulator:
+extern void cpu65_nmi_debug_callback ( void );
+extern void cpu65_irq_debug_callback ( void );
+extern void cpu65_execution_debug_callback ( void );
+// --
+static XEMU_INLINE void cpu65_stop ( void ) {
+	CPU65.running = false;
+}
+static XEMU_INLINE void cpu65_continue ( void ) {
+	CPU65.running = true;
+}
+static XEMU_INLINE void cpu65_enable_debug_callbacks ( void ) {
+	CPU65.execution_debug_callback = true;
+}
+static XEMU_INLINE void cpu65_disable_debug_callbacks ( void ) {
+	CPU65.running = true;
+	CPU65.execution_debug_callback = false;
+}
+#define CPU65_IS_RUNNING() CPU65.running
+#else
+#define CPU65_IS_RUNNING() 1
+#endif
+
 #ifdef CPU65_TRAP_OPCODE
-extern int  cpu65_trap_callback ( Uint8 opcode );
+extern int  cpu65_trap_callback ( const Uint8 opcode );
 #endif
 #ifdef CPU_65CE02
 extern void cpu65_do_aug_callback ( void );
 extern void cpu65_do_nop_callback ( void );
 #endif
 
-extern void  cpu65_set_pf ( Uint8 st );
+extern void  cpu65_set_pf ( const Uint8 st );
 extern Uint8 cpu65_get_pf ( void );
 
 #ifdef XEMU_SNAPSHOT_SUPPORT
